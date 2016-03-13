@@ -1,0 +1,6 @@
+[package]
+
+name = "indexed_collections"
+version = "0.0.1-dev"
+authors = [ "Mikhail Zabaluev <mikhail.zabaluev@gmail.com>" ]
+description = "Collections of objects with internal keys"
