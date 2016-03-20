@@ -1,6 +1,6 @@
+// Copyright © 2016  Mikhail Zabaluev <mikhail.zabaluev@gmail.com>
 // Copyright 2014-2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
+// file at the top-level directory of this distribution.
 //
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
 // http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
@@ -19,12 +19,16 @@ use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{self, Unique};
 
+use zipped::{AsZippedRefs, CloneZipped, ZippedPtrs};
+
 use self::BucketState::*;
 
 const EMPTY_BUCKET: u64 = 0;
 
 /// The raw hashtable, providing safe-ish access to the unzipped and highly
-/// optimized arrays of hashes, keys, and values.
+/// optimized arrays of hashes, keys, and values (the latter two are
+/// abstracted behind an implementation of `ZippedPtrs`, to allow storing
+/// just the hashed values).
 ///
 /// This design uses less memory and is a lot faster than the naive
 /// `Vec<Option<u64, K, V>>`, because we don't pay for the overhead of an
@@ -60,71 +64,69 @@ const EMPTY_BUCKET: u64 = 0;
 /// invariants at the type level and employs some performance trickery,
 /// but in general is just a tricked out `Vec<Option<u64, K, V>>`.
 #[unsafe_no_drop_flag]
-pub struct RawTable<K, V> {
+pub struct RawTable<Z: ZippedPtrs> {
     capacity: usize,
     size:     usize,
     hashes:   Unique<u64>,
 
-    // Because K/V do not appear directly in any of the types in the struct,
-    // inform rustc that in fact instances of K and V are reachable from here.
-    marker:   marker::PhantomData<(K,V)>,
+    // Because Z does not appear directly in any of the types in the struct,
+    // inform rustc that in fact instances of Z are reachable from here.
+    marker:   marker::PhantomData<Z>,
 }
 
-unsafe impl<K: Send, V: Send> Send for RawTable<K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for RawTable<K, V> {}
+unsafe impl<Z> Send for RawTable<Z> where Z: ZippedPtrs, Z::Values: Send {}
+unsafe impl<Z> Sync for RawTable<Z> where Z: ZippedPtrs, Z::Values: Sync {}
 
-struct RawBucket<K, V> {
+struct RawBucket<Z> {
     hash: *mut u64,
-    key:  *mut K,
-    val:  *mut V,
-    _marker: marker::PhantomData<(K,V)>,
+    data: Z,
 }
 
-impl<K,V> Copy for RawBucket<K,V> {}
-impl<K,V> Clone for RawBucket<K,V> {
-    fn clone(&self) -> RawBucket<K, V> { *self }
+impl<Z: Copy> Copy for RawBucket<Z> {}
+impl<Z: Copy> Clone for RawBucket<Z> {
+    fn clone(&self) -> RawBucket<Z> { *self }
 }
 
-pub struct Bucket<K, V, M> {
-    raw:   RawBucket<K, V>,
+pub struct Bucket<Z, M> {
+    raw:   RawBucket<Z>,
     idx:   usize,
     table: M
 }
 
-impl<K,V,M:Copy> Copy for Bucket<K,V,M> {}
-impl<K,V,M:Copy> Clone for Bucket<K,V,M> {
-    fn clone(&self) -> Bucket<K,V,M> { *self }
+impl<Z: Copy, M: Copy> Copy for Bucket<Z, M> {}
+impl<Z: Copy, M: Copy> Clone for Bucket<Z, M> {
+    fn clone(&self) -> Bucket<Z, M> { *self }
 }
 
-pub struct EmptyBucket<K, V, M> {
-    raw:   RawBucket<K, V>,
+pub struct EmptyBucket<Z, M> {
+    raw:   RawBucket<Z>,
     idx:   usize,
     table: M
 }
 
-pub struct FullBucket<K, V, M> {
-    raw:   RawBucket<K, V>,
+pub struct FullBucket<Z, M> {
+    raw:   RawBucket<Z>,
     idx:   usize,
     table: M
 }
 
-pub type EmptyBucketImm<'table, K, V> = EmptyBucket<K, V, &'table RawTable<K, V>>;
-pub type  FullBucketImm<'table, K, V> =  FullBucket<K, V, &'table RawTable<K, V>>;
+pub type EmptyBucketImm<'table, Z> = EmptyBucket<Z, &'table RawTable<Z>>;
+pub type FullBucketImm<'table, Z> = FullBucket<Z, &'table RawTable<Z>>;
 
-pub type EmptyBucketMut<'table, K, V> = EmptyBucket<K, V, &'table mut RawTable<K, V>>;
-pub type  FullBucketMut<'table, K, V> =  FullBucket<K, V, &'table mut RawTable<K, V>>;
+pub type EmptyBucketMut<'table, Z> = EmptyBucket<Z, &'table mut RawTable<Z>>;
+pub type FullBucketMut<'table, Z> = FullBucket<Z, &'table mut RawTable<Z>>;
 
-pub enum BucketState<K, V, M> {
-    Empty(EmptyBucket<K, V, M>),
-    Full(FullBucket<K, V, M>),
+pub enum BucketState<Z, M> {
+    Empty(EmptyBucket<Z, M>),
+    Full(FullBucket<Z, M>),
 }
 
 // A GapThenFull encapsulates the state of two consecutive buckets at once.
 // The first bucket, called the gap, is known to be empty.
 // The second bucket is full.
-pub struct GapThenFull<K, V, M> {
-    gap: EmptyBucket<K, V, ()>,
-    full: FullBucket<K, V, M>,
+pub struct GapThenFull<Z, M> {
+    gap: EmptyBucket<Z, ()>,
+    full: FullBucket<Z, M>,
 }
 
 /// A hash that is not zero, since we use a hash of zero to represent empty
@@ -169,19 +171,17 @@ fn can_alias_safehash_as_u64() {
     assert_eq!(size_of::<SafeHash>(), size_of::<u64>())
 }
 
-impl<K, V> RawBucket<K, V> {
-    unsafe fn offset(self, count: isize) -> RawBucket<K, V> {
+impl<Z: ZippedPtrs> RawBucket<Z> {
+    unsafe fn offset(&self, count: isize) -> RawBucket<Z> {
         RawBucket {
             hash: self.hash.offset(count),
-            key:  self.key.offset(count),
-            val:  self.val.offset(count),
-            _marker: marker::PhantomData,
+            data: self.data.offset(count)
         }
     }
 }
 
 // Buckets hold references to the table.
-impl<K, V, M> FullBucket<K, V, M> {
+impl<Z, M> FullBucket<Z, M> {
     /// Borrow a reference to the table.
     pub fn table(&self) -> &M {
         &self.table
@@ -196,7 +196,7 @@ impl<K, V, M> FullBucket<K, V, M> {
     }
 }
 
-impl<K, V, M> EmptyBucket<K, V, M> {
+impl<Z, M> EmptyBucket<Z, M> {
     /// Borrow a reference to the table.
     pub fn table(&self) -> &M {
         &self.table
@@ -207,7 +207,7 @@ impl<K, V, M> EmptyBucket<K, V, M> {
     }
 }
 
-impl<K, V, M> Bucket<K, V, M> {
+impl<Z, M> Bucket<Z, M> {
     /// Move out the reference to the table.
     pub fn into_table(self) -> M {
         self.table
@@ -218,12 +218,14 @@ impl<K, V, M> Bucket<K, V, M> {
     }
 }
 
-impl<K, V, M: Deref<Target=RawTable<K, V>>> Bucket<K, V, M> {
-    pub fn new(table: M, hash: SafeHash) -> Bucket<K, V, M> {
+impl<Z, M> Bucket<Z, M>
+    where Z: ZippedPtrs, M: Deref<Target=RawTable<Z>>
+{
+    pub fn new(table: M, hash: SafeHash) -> Bucket<Z, M> {
         Bucket::at_index(table, hash.inspect() as usize)
     }
 
-    pub fn at_index(table: M, ib_index: usize) -> Bucket<K, V, M> {
+    pub fn at_index(table: M, ib_index: usize) -> Bucket<Z, M> {
         // if capacity is 0, then the RawBucket will be populated with bogus pointers.
         // This is an uncommon case though, so avoid it in release builds.
         debug_assert!(table.capacity() > 0, "Table should have capacity at this point");
@@ -237,7 +239,7 @@ impl<K, V, M: Deref<Target=RawTable<K, V>>> Bucket<K, V, M> {
         }
     }
 
-    pub fn first(table: M) -> Bucket<K, V, M> {
+    pub fn first(table: M) -> Bucket<Z, M> {
         Bucket {
             raw: table.first_bucket_raw(),
             idx: 0,
@@ -249,7 +251,7 @@ impl<K, V, M: Deref<Target=RawTable<K, V>>> Bucket<K, V, M> {
     /// it's initialized or not. You need to match on this enum to get
     /// the appropriate types to call most of the other functions in
     /// this module.
-    pub fn peek(self) -> BucketState<K, V, M> {
+    pub fn peek(self) -> BucketState<Z, M> {
         match unsafe { *self.raw.hash } {
             EMPTY_BUCKET =>
                 Empty(EmptyBucket {
@@ -290,16 +292,18 @@ impl<K, V, M: Deref<Target=RawTable<K, V>>> Bucket<K, V, M> {
     }
 }
 
-impl<K, V, M: Deref<Target=RawTable<K, V>>> EmptyBucket<K, V, M> {
+impl<Z, M> EmptyBucket<Z, M>
+    where Z: ZippedPtrs + Copy, M: Deref<Target=RawTable<Z>>
+{
     #[inline]
-    pub fn next(self) -> Bucket<K, V, M> {
+    pub fn next(self) -> Bucket<Z, M> {
         let mut bucket = self.into_bucket();
         bucket.next();
         bucket
     }
 
     #[inline]
-    pub fn into_bucket(self) -> Bucket<K, V, M> {
+    pub fn into_bucket(self) -> Bucket<Z, M> {
         Bucket {
             raw: self.raw,
             idx: self.idx,
@@ -307,7 +311,7 @@ impl<K, V, M: Deref<Target=RawTable<K, V>>> EmptyBucket<K, V, M> {
         }
     }
 
-    pub fn gap_peek(self) -> Option<GapThenFull<K, V, M>> {
+    pub fn gap_peek(self) -> Option<GapThenFull<Z, M>> {
         let gap = EmptyBucket {
             raw: self.raw,
             idx: self.idx,
@@ -326,20 +330,21 @@ impl<K, V, M: Deref<Target=RawTable<K, V>>> EmptyBucket<K, V, M> {
     }
 }
 
-impl<K, V, M: Deref<Target=RawTable<K, V>> + DerefMut> EmptyBucket<K, V, M> {
-    /// Puts given key and value pair, along with the key's hash,
+impl<Z, M> EmptyBucket<Z, M>
+    where Z: ZippedPtrs, M: Deref<Target=RawTable<Z>> + DerefMut
+{
+    /// Puts given table entry, along with the key's hash,
     /// into this bucket in the hashtable. Note how `self` is 'moved' into
     /// this function, because this slot will no longer be empty when
     /// we return! A `FullBucket` is returned for later use, pointing to
     /// the newly-filled slot in the hashtable.
     ///
     /// Use `make_hash` to construct a `SafeHash` to pass to this function.
-    pub fn put(mut self, hash: SafeHash, key: K, value: V)
-               -> FullBucket<K, V, M> {
+    pub fn put(mut self, hash: SafeHash, data: Z::Values)
+               -> FullBucket<Z, M> {
         unsafe {
             *self.raw.hash = hash.inspect();
-            ptr::write(self.raw.key, key);
-            ptr::write(self.raw.val, value);
+            self.raw.data.write(data);
         }
 
         self.table.size += 1;
@@ -348,16 +353,18 @@ impl<K, V, M: Deref<Target=RawTable<K, V>> + DerefMut> EmptyBucket<K, V, M> {
     }
 }
 
-impl<K, V, M: Deref<Target=RawTable<K, V>>> FullBucket<K, V, M> {
+impl<Z, M> FullBucket<Z, M>
+    where Z: ZippedPtrs, M: Deref<Target=RawTable<Z>>
+{
     #[inline]
-    pub fn next(self) -> Bucket<K, V, M> {
+    pub fn next(self) -> Bucket<Z, M> {
         let mut bucket = self.into_bucket();
         bucket.next();
         bucket
     }
 
     #[inline]
-    pub fn into_bucket(self) -> Bucket<K, V, M> {
+    pub fn into_bucket(self) -> Bucket<Z, M> {
         Bucket {
             raw: self.raw,
             idx: self.idx,
@@ -385,22 +392,36 @@ impl<K, V, M: Deref<Target=RawTable<K, V>>> FullBucket<K, V, M> {
             }
         }
     }
+}
 
-    /// Gets references to the key and value at a given index.
-    pub fn read(&self) -> (&K, &V) {
+impl<Z, M> FullBucket<Z, M> where for<'a> Z: AsZippedRefs<'a>
+{
+    /// Gets references to the entry values at a given index.
+    pub fn read<'t>(&'t self) -> <Z as AsZippedRefs<'t>>::Refs {
         unsafe {
-            (&*self.raw.key,
-             &*self.raw.val)
+            self.raw.data.as_refs()
         }
     }
 }
 
-impl<K, V, M: Deref<Target=RawTable<K, V>> + DerefMut> FullBucket<K, V, M> {
+impl<Z, M> FullBucket<Z, M>
+    where Z: CloneZipped
+{
+    pub fn clone_values(&self) -> Z::Values {
+        unsafe {
+            self.raw.data.clone_zipped()
+        }
+    }
+}
+
+impl<Z, M> FullBucket<Z, M>
+    where Z: ZippedPtrs + Copy, M: Deref<Target=RawTable<Z>> + DerefMut
+{
     /// Removes this bucket's key and value from the hashtable.
     ///
     /// This works similarly to `put`, building an `EmptyBucket` out of the
     /// taken bucket.
-    pub fn take(mut self) -> (EmptyBucket<K, V, M>, K, V) {
+    pub fn take(mut self) -> (EmptyBucket<Z, M>, Z::Values) {
         self.table.size -= 1;
 
         unsafe {
@@ -411,59 +432,61 @@ impl<K, V, M: Deref<Target=RawTable<K, V>> + DerefMut> FullBucket<K, V, M> {
                     idx: self.idx,
                     table: self.table
                 },
-                ptr::read(self.raw.key),
-                ptr::read(self.raw.val)
+                self.raw.data.read()
             )
         }
     }
 
-    pub fn replace(&mut self, h: SafeHash, k: K, v: V) -> (SafeHash, K, V) {
+    pub fn replace(&mut self, h: SafeHash, v: Z::Values) -> (SafeHash, Z::Values) {
         unsafe {
             let old_hash = ptr::replace(self.raw.hash as *mut SafeHash, h);
-            let old_key  = ptr::replace(self.raw.key,  k);
-            let old_val  = ptr::replace(self.raw.val,  v);
+            let old_val  = self.raw.data.replace(v);
 
-            (old_hash, old_key, old_val)
-        }
-    }
-
-    /// Gets mutable references to the key and value at a given index.
-    pub fn read_mut(&mut self) -> (&mut K, &mut V) {
-        unsafe {
-            (&mut *self.raw.key,
-             &mut *self.raw.val)
+            (old_hash, old_val)
         }
     }
 }
 
-impl<'t, K, V, M: Deref<Target=RawTable<K, V>> + 't> FullBucket<K, V, M> {
+impl<Z, M> FullBucket<Z, M> where for<'a> Z: AsZippedRefs<'a>
+{
+    /// Gets mutable references to the key and value at a given index.
+    pub fn read_mut<'t>(&'t mut self) -> <Z as AsZippedRefs<'t>>::MutRefs {
+        unsafe {
+            self.raw.data.as_mut_refs()
+        }
+    }
+}
+
+impl<'t, Z, M> FullBucket<Z, M>
+    where Z: AsZippedRefs<'t>, M: Deref<Target=RawTable<Z>> + 't
+{
     /// Exchange a bucket state for immutable references into the table.
     /// Because the underlying reference to the table is also consumed,
     /// no further changes to the structure of the table are possible;
     /// in exchange for this, the returned references have a longer lifetime
     /// than the references returned by `read()`.
-    pub fn into_refs(self) -> (&'t K, &'t V) {
+    pub fn into_refs(self) -> Z::Refs {
         unsafe {
-            (&*self.raw.key,
-             &*self.raw.val)
+            self.raw.data.as_refs()
         }
     }
 }
 
-impl<'t, K, V, M: Deref<Target=RawTable<K, V>> + DerefMut + 't> FullBucket<K, V, M> {
+impl<'t, Z, M> FullBucket<Z, M>
+    where Z: AsZippedRefs<'t>, M: Deref<Target=RawTable<Z>> + DerefMut + 't
+{
     /// This works similarly to `into_refs`, exchanging a bucket state
     /// for mutable references into the table.
-    pub fn into_mut_refs(self) -> (&'t mut K, &'t mut V) {
+    pub fn into_mut_refs(self) -> Z::MutRefs {
         unsafe {
-            (&mut *self.raw.key,
-             &mut *self.raw.val)
+            self.raw.data.as_mut_refs()
         }
     }
 }
 
-impl<K, V, M> BucketState<K, V, M> {
+impl<Z, M> BucketState<Z, M> {
     // For convenience.
-    pub fn expect_full(self) -> FullBucket<K, V, M> {
+    pub fn expect_full(self) -> FullBucket<Z, M> {
         match self {
             Full(full) => full,
             Empty(..) => panic!("Expected full bucket")
@@ -471,17 +494,24 @@ impl<K, V, M> BucketState<K, V, M> {
     }
 }
 
-impl<K, V, M: Deref<Target=RawTable<K, V>>> GapThenFull<K, V, M> {
+impl<Z, M> GapThenFull<Z, M>
+    where Z: ZippedPtrs, M: Deref<Target=RawTable<Z>>
+{
     #[inline]
-    pub fn full(&self) -> &FullBucket<K, V, M> {
+    pub fn full(&self) -> &FullBucket<Z, M> {
         &self.full
     }
+}
 
-    pub fn shift(mut self) -> Option<GapThenFull<K, V, M>> {
+impl<Z, M> GapThenFull<Z, M>
+    where Z: ZippedPtrs + Copy, M: Deref<Target=RawTable<Z>>
+{
+    pub fn shift(mut self) -> Option<GapThenFull<Z, M>> {
         unsafe {
             *self.gap.raw.hash = mem::replace(&mut *self.full.raw.hash, EMPTY_BUCKET);
-            ptr::copy_nonoverlapping(self.full.raw.key, self.gap.raw.key, 1);
-            ptr::copy_nonoverlapping(self.full.raw.val, self.gap.raw.val, 1);
+            ZippedPtrs::copy_nonoverlapping(&self.full.raw.data,
+                                            &self.gap.raw.data,
+                                            1);
         }
 
         let FullBucket { raw: prev_raw, idx: prev_idx, .. } = self.full;
@@ -501,74 +531,45 @@ impl<K, V, M: Deref<Target=RawTable<K, V>>> GapThenFull<K, V, M> {
 }
 
 
-/// Rounds up to a multiple of a power of two. Returns the closest multiple
-/// of `target_alignment` that is higher or equal to `unrounded`.
-///
-/// # Panics
-///
-/// Panics if `target_alignment` is not a power of two.
-#[inline]
-fn round_up_to_next(unrounded: usize, target_alignment: usize) -> usize {
-    assert!(target_alignment.is_power_of_two());
-    (unrounded + target_alignment - 1) & !(target_alignment - 1)
+fn allocation_align<Z>() -> usize
+    where Z: ZippedPtrs
+{
+    cmp::max(align_of::<u64>(), <Z as ZippedPtrs>::align())
 }
 
-#[test]
-fn test_rounding() {
-    assert_eq!(round_up_to_next(0, 4), 0);
-    assert_eq!(round_up_to_next(1, 4), 4);
-    assert_eq!(round_up_to_next(2, 4), 4);
-    assert_eq!(round_up_to_next(3, 4), 4);
-    assert_eq!(round_up_to_next(4, 4), 4);
-    assert_eq!(round_up_to_next(5, 4), 8);
+fn allocation_size<Z: ZippedPtrs>(capacity: usize) -> usize {
+    let hashes_size = capacity.checked_mul(size_of::<u64>())
+                        .expect("capacity overflow");
+    <Z as ZippedPtrs>::alloc_size_append(hashes_size, capacity)
+        .expect("capacity overflow")
 }
 
-// Returns a tuple of (key_offset, val_offset),
-// from the start of a mallocated array.
-#[inline]
-fn calculate_offsets(hashes_size: usize,
-                     keys_size: usize, keys_align: usize,
-                     vals_align: usize)
-                     -> (usize, usize, bool) {
-    let keys_offset = round_up_to_next(hashes_size, keys_align);
-    let (end_of_keys, oflo) = keys_offset.overflowing_add(keys_size);
-
-    let vals_offset = round_up_to_next(end_of_keys, vals_align);
-
-    (keys_offset, vals_offset, oflo)
-}
-
-// Returns a tuple of (minimum required malloc alignment, hash_offset,
-// array_size), from the start of a mallocated array.
-fn calculate_allocation(hash_size: usize, hash_align: usize,
-                        keys_size: usize, keys_align: usize,
-                        vals_size: usize, vals_align: usize)
-                        -> (usize, usize, usize, bool) {
-    let hash_offset = 0;
-    let (_, vals_offset, oflo) = calculate_offsets(hash_size,
-                                                   keys_size, keys_align,
-                                                              vals_align);
-    let (end_of_vals, oflo2) = vals_offset.overflowing_add(vals_size);
-
-    let align = cmp::max(hash_align, cmp::max(keys_align, vals_align));
-
-    (align, hash_offset, end_of_vals, oflo || oflo2)
+// Like allocation_size, but without any overflow checks
+fn allocation_size_unchecked<Z: ZippedPtrs>(capacity: usize) -> usize {
+    let hashes_size = capacity * size_of::<u64>();
+    <Z as ZippedPtrs>::alloc_size_append_unchecked(hashes_size, capacity)
 }
 
 #[test]
 fn test_offset_calculation() {
-    assert_eq!(calculate_allocation(128, 8, 15, 1, 4,  4), (8, 0, 148, false));
-    assert_eq!(calculate_allocation(3,   1, 2,  1, 1,  1), (1, 0, 6, false));
-    assert_eq!(calculate_allocation(6,   2, 12, 4, 24, 8), (8, 0, 48, false));
-    assert_eq!(calculate_offsets(128, 15, 1, 4), (128, 144, false));
-    assert_eq!(calculate_offsets(3,   2,  1, 1), (3,   5, false));
-    assert_eq!(calculate_offsets(6,   12, 4, 8), (8,   24, false));
+
+    use zipped::{LonePtr, PairPtrs};
+
+    fn calculate_both_ways<Z: ZippedPtrs>(capacity: usize) -> usize {
+        let size_checked = allocation_size::<Z>(capacity);
+        let size_unchecked = allocation_size_unchecked::<Z>(capacity);
+        assert_eq!(size_checked, size_unchecked);
+        size_checked
+    }
+
+    assert_eq!(calculate_both_ways::<LonePtr<u16>>(7), 56 + 14);
+    assert_eq!(calculate_both_ways::<PairPtrs<u8, u16>>(7), 56 + 8 + 14);
 }
 
-impl<K, V> RawTable<K, V> {
+impl<Z: ZippedPtrs> RawTable<Z> {
     /// Does not initialize the buckets. The caller should ensure they,
     /// at the very least, set every hash to EMPTY_BUCKET.
-    unsafe fn new_uninitialized(capacity: usize) -> RawTable<K, V> {
+    unsafe fn new_uninitialized(capacity: usize) -> RawTable<Z> {
         if capacity == 0 {
             return RawTable {
                 size: 0,
@@ -578,39 +579,21 @@ impl<K, V> RawTable<K, V> {
             };
         }
 
-        // No need for `checked_mul` before a more restrictive check performed
-        // later in this method.
-        let hashes_size = capacity * size_of::<u64>();
-        let keys_size   = capacity * size_of::< K >();
-        let vals_size   = capacity * size_of::< V >();
-
-        // Allocating hashmaps is a little tricky. We need to allocate three
-        // arrays, but since we know their sizes and alignments up front,
-        // we just allocate a single array, and then have the subarrays
-        // point into it.
+        // Allocating hash tables is a little tricky. We need to allocate
+        // arrays for each column, but since we know their sizes and
+        // alignments up front, we just allocate a single array, and then
+        // have the subarrays point into it.
         //
         // This is great in theory, but in practice getting the alignment
         // right is a little subtle. Therefore, calculating offsets has been
         // factored out into a different function.
-        let (malloc_alignment, hash_offset, size, oflo) =
-            calculate_allocation(
-                hashes_size, align_of::<u64>(),
-                keys_size,   align_of::< K >(),
-                vals_size,   align_of::< V >());
-
-        assert!(!oflo, "capacity overflow");
-
-        // One check for overflow that covers calculation and rounding of size.
-        let size_of_bucket = size_of::<u64>().checked_add(size_of::<K>()).unwrap()
-                                             .checked_add(size_of::<V>()).unwrap();
-        assert!(size >= capacity.checked_mul(size_of_bucket)
-                                .expect("capacity overflow"),
-                "capacity overflow");
+        let size = allocation_size::<Z>(capacity);
+        let malloc_alignment = allocation_align::<Z>();
 
         let buffer = allocate(size, malloc_alignment);
         if buffer.is_null() { ::alloc::oom() }
 
-        let hashes = buffer.offset(hash_offset as isize) as *mut u64;
+        let hashes = buffer as *mut u64;
 
         RawTable {
             capacity: capacity,
@@ -620,29 +603,23 @@ impl<K, V> RawTable<K, V> {
         }
     }
 
-    fn first_bucket_raw(&self) -> RawBucket<K, V> {
+    fn first_bucket_raw(&self) -> RawBucket<Z> {
         let hashes_size = self.capacity * size_of::<u64>();
-        let keys_size = self.capacity * size_of::<K>();
-
         let buffer = *self.hashes as *mut u8;
-        let (keys_offset, vals_offset, oflo) =
-            calculate_offsets(hashes_size,
-                              keys_size, align_of::<K>(),
-                              align_of::<V>());
-        debug_assert!(!oflo, "capacity overflow");
         unsafe {
+            let data = ZippedPtrs::from_unzipped_buf(buffer,
+                                                     hashes_size,
+                                                     self.capacity);
             RawBucket {
                 hash: *self.hashes,
-                key:  buffer.offset(keys_offset as isize) as *mut K,
-                val:  buffer.offset(vals_offset as isize) as *mut V,
-                _marker: marker::PhantomData,
+                data: data
             }
         }
     }
 
     /// Creates a new raw table from a given capacity. All buckets are
     /// initially empty.
-    pub fn new(capacity: usize) -> RawTable<K, V> {
+    pub fn new(capacity: usize) -> RawTable<Z> {
         unsafe {
             let ret = RawTable::new_uninitialized(capacity);
             ptr::write_bytes(*ret.hashes, 0, capacity);
@@ -661,7 +638,7 @@ impl<K, V> RawTable<K, V> {
         self.size
     }
 
-    fn raw_buckets(&self) -> RawBuckets<K, V> {
+    fn raw_buckets(&self) -> RawBuckets<Z> {
         RawBuckets {
             raw: self.first_bucket_raw(),
             hashes_end: unsafe {
@@ -671,21 +648,21 @@ impl<K, V> RawTable<K, V> {
         }
     }
 
-    pub fn iter(&self) -> Iter<K, V> {
+    pub fn iter(&self) -> Iter<Z> {
         Iter {
             iter: self.raw_buckets(),
             elems_left: self.size(),
         }
     }
 
-    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+    pub fn iter_mut(&mut self) -> IterMut<Z> {
         IterMut {
             iter: self.raw_buckets(),
             elems_left: self.size(),
         }
     }
 
-    pub fn into_iter(self) -> IntoIter<K, V> {
+    pub fn into_iter(self) -> IntoIter<Z> {
         let RawBuckets { raw, hashes_end, .. } = self.raw_buckets();
         // Replace the marker regardless of lifetime bounds on parameters.
         IntoIter {
@@ -698,7 +675,7 @@ impl<K, V> RawTable<K, V> {
         }
     }
 
-    pub fn drain(&mut self) -> Drain<K, V> {
+    pub fn drain(&mut self) -> Drain<Z> {
         let RawBuckets { raw, hashes_end, .. } = self.raw_buckets();
         // Replace the marker regardless of lifetime bounds on parameters.
         Drain {
@@ -713,7 +690,7 @@ impl<K, V> RawTable<K, V> {
 
     /// Returns an iterator that copies out each entry. Used while the table
     /// is being dropped.
-    unsafe fn rev_move_buckets(&mut self) -> RevMoveBuckets<K, V> {
+    unsafe fn rev_move_buckets(&mut self) -> RevMoveBuckets<Z> {
         let raw_bucket = self.first_bucket_raw();
         RevMoveBuckets {
             raw: raw_bucket.offset(self.capacity as isize),
@@ -726,21 +703,20 @@ impl<K, V> RawTable<K, V> {
 
 /// A raw iterator. The basis for some other iterators in this module. Although
 /// this interface is safe, it's not used outside this module.
-struct RawBuckets<'a, K, V> {
-    raw: RawBucket<K, V>,
+struct RawBuckets<'a, Z> {
+    raw: RawBucket<Z>,
     hashes_end: *mut u64,
 
-    // Strictly speaking, this should be &'a (K,V), but that would
-    // require that K:'a, and we often use RawBuckets<'static...> for
+    // Strictly speaking, this should be `&'a Z`, but that would
+    // require that Z:'a, and we often use RawBuckets<'static...> for
     // move iterations, so that messes up a lot of other things. So
-    // just use `&'a (K,V)` as this is not a publicly exposed type
+    // just use `&'a ()` as this is not a publicly exposed type
     // anyway.
     marker: marker::PhantomData<&'a ()>,
 }
 
-// FIXME(#19839) Remove in favor of `#[derive(Clone)]`
-impl<'a, K, V> Clone for RawBuckets<'a, K, V> {
-    fn clone(&self) -> RawBuckets<'a, K, V> {
+impl<'a, Z: Copy> Clone for RawBuckets<'a, Z> {
+    fn clone(&self) -> RawBuckets<'a, Z> {
         RawBuckets {
             raw: self.raw,
             hashes_end: self.hashes_end,
@@ -750,10 +726,10 @@ impl<'a, K, V> Clone for RawBuckets<'a, K, V> {
 }
 
 
-impl<'a, K, V> Iterator for RawBuckets<'a, K, V> {
-    type Item = RawBucket<K, V>;
+impl<'a, Z: ZippedPtrs> Iterator for RawBuckets<'a, Z> {
+    type Item = RawBucket<Z>;
 
-    fn next(&mut self) -> Option<RawBucket<K, V>> {
+    fn next(&mut self) -> Option<RawBucket<Z>> {
         while self.raw.hash != self.hashes_end {
             unsafe {
                 // We are swapping out the pointer to a bucket and replacing
@@ -772,21 +748,21 @@ impl<'a, K, V> Iterator for RawBuckets<'a, K, V> {
 /// An iterator that moves out buckets in reverse order. It leaves the table
 /// in an inconsistent state and should only be used for dropping
 /// the table's remaining entries. It's used in the implementation of Drop.
-struct RevMoveBuckets<'a, K, V> {
-    raw: RawBucket<K, V>,
+struct RevMoveBuckets<'a, Z> {
+    raw: RawBucket<Z>,
     hashes_end: *mut u64,
     elems_left: usize,
 
-    // As above, `&'a (K,V)` would seem better, but we often use
+    // As above, `&'a Z` would seem better, but we often use
     // 'static for the lifetime, and this is not a publicly exposed
     // type.
     marker: marker::PhantomData<&'a ()>,
 }
 
-impl<'a, K, V> Iterator for RevMoveBuckets<'a, K, V> {
-    type Item = (K, V);
+impl<'a, Z: ZippedPtrs> Iterator for RevMoveBuckets<'a, Z> {
+    type Item = Z::Values;
 
-    fn next(&mut self) -> Option<(K, V)> {
+    fn next(&mut self) -> Option<Z::Values> {
         if self.elems_left == 0 {
             return None;
         }
@@ -799,10 +775,7 @@ impl<'a, K, V> Iterator for RevMoveBuckets<'a, K, V> {
 
                 if *self.raw.hash != EMPTY_BUCKET {
                     self.elems_left -= 1;
-                    return Some((
-                        ptr::read(self.raw.key),
-                        ptr::read(self.raw.val)
-                    ));
+                    return Some(self.raw.data.read());
                 }
             }
         }
@@ -810,17 +783,16 @@ impl<'a, K, V> Iterator for RevMoveBuckets<'a, K, V> {
 }
 
 /// Iterator over shared references to entries in a table.
-pub struct Iter<'a, K: 'a, V: 'a> {
-    iter: RawBuckets<'a, K, V>,
+pub struct Iter<'a, Z> {
+    iter: RawBuckets<'a, Z>,
     elems_left: usize,
 }
 
-unsafe impl<'a, K: Sync, V: Sync> Sync for Iter<'a, K, V> {}
-unsafe impl<'a, K: Sync, V: Sync> Send for Iter<'a, K, V> {}
+unsafe impl<'a, Z> Sync for Iter<'a, Z> where Z: ZippedPtrs, Z::Values: Sync {}
+unsafe impl<'a, Z> Send for Iter<'a, Z> where Z: ZippedPtrs, Z::Values: Sync {}
 
-// FIXME(#19839) Remove in favor of `#[derive(Clone)]`
-impl<'a, K, V> Clone for Iter<'a, K, V> {
-    fn clone(&self) -> Iter<'a, K, V> {
+impl<'a, Z: Copy> Clone for Iter<'a, Z> {
+    fn clone(&self) -> Iter<'a, Z> {
         Iter {
             iter: self.iter.clone(),
             elems_left: self.elems_left
@@ -830,43 +802,46 @@ impl<'a, K, V> Clone for Iter<'a, K, V> {
 
 
 /// Iterator over mutable references to entries in a table.
-pub struct IterMut<'a, K: 'a, V: 'a> {
-    iter: RawBuckets<'a, K, V>,
+pub struct IterMut<'a, Z> {
+    iter: RawBuckets<'a, Z>,
     elems_left: usize,
 }
 
-unsafe impl<'a, K: Sync, V: Sync> Sync for IterMut<'a, K, V> {}
-// Both K: Sync and K: Send are correct for IterMut's Send impl,
+unsafe impl<'a, Z> Sync for IterMut<'a, Z>
+    where Z: ZippedPtrs, Z::Values: Sync {}
+// Both Z::Values: Sync and Z::Values: Send are correct for IterMut's Send impl,
 // but Send is the more useful bound
-unsafe impl<'a, K: Send, V: Send> Send for IterMut<'a, K, V> {}
+unsafe impl<'a, Z> Send for IterMut<'a, Z>
+    where Z: ZippedPtrs, Z::Values: Send {}
 
 /// Iterator over the entries in a table, consuming the table.
-pub struct IntoIter<K, V> {
-    table: RawTable<K, V>,
-    iter: RawBuckets<'static, K, V>
+pub struct IntoIter<Z: ZippedPtrs> {
+    table: RawTable<Z>,
+    iter: RawBuckets<'static, Z>
 }
 
-unsafe impl<K: Sync, V: Sync> Sync for IntoIter<K, V> {}
-unsafe impl<K: Send, V: Send> Send for IntoIter<K, V> {}
+unsafe impl<Z> Sync for IntoIter<Z> where Z: ZippedPtrs, Z::Values: Sync {}
+unsafe impl<Z> Send for IntoIter<Z> where Z: ZippedPtrs, Z::Values: Send {}
 
 /// Iterator over the entries in a table, clearing the table.
-pub struct Drain<'a, K: 'a, V: 'a> {
-    table: &'a mut RawTable<K, V>,
-    iter: RawBuckets<'static, K, V>,
+pub struct Drain<'a, Z: ZippedPtrs + 'a> {
+    table: &'a mut RawTable<Z>,
+    iter: RawBuckets<'static, Z>,
 }
 
-unsafe impl<'a, K: Sync, V: Sync> Sync for Drain<'a, K, V> {}
-unsafe impl<'a, K: Send, V: Send> Send for Drain<'a, K, V> {}
+unsafe impl<'a, Z> Sync for Drain<'a, Z>
+    where Z: ZippedPtrs, Z::Values: Sync {}
+unsafe impl<'a, Z> Send for Drain<'a, Z>
+    where Z: ZippedPtrs, Z::Values: Send {}
 
-impl<'a, K, V> Iterator for Iter<'a, K, V> {
-    type Item = (&'a K, &'a V);
+impl<'a, Z: AsZippedRefs<'a>> Iterator for Iter<'a, Z> {
+    type Item = Z::Refs;
 
-    fn next(&mut self) -> Option<(&'a K, &'a V)> {
+    fn next(&mut self) -> Option<Z::Refs> {
         self.iter.next().map(|bucket| {
             self.elems_left -= 1;
             unsafe {
-                (&*bucket.key,
-                 &*bucket.val)
+                bucket.data.as_refs()
             }
         })
     }
@@ -875,19 +850,18 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
         (self.elems_left, Some(self.elems_left))
     }
 }
-impl<'a, K, V> ExactSizeIterator for Iter<'a, K, V> {
+impl<'a, Z: AsZippedRefs<'a>> ExactSizeIterator for Iter<'a, Z> {
     fn len(&self) -> usize { self.elems_left }
 }
 
-impl<'a, K, V> Iterator for IterMut<'a, K, V> {
-    type Item = (&'a K, &'a mut V);
+impl<'a, Z: AsZippedRefs<'a>> Iterator for IterMut<'a, Z> {
+    type Item = Z::MutRefs;
 
-    fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
+    fn next(&mut self) -> Option<Z::MutRefs> {
         self.iter.next().map(|bucket| {
             self.elems_left -= 1;
             unsafe {
-                (&*bucket.key,
-                 &mut *bucket.val)
+                bucket.data.as_mut_refs()
             }
         })
     }
@@ -896,14 +870,14 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
         (self.elems_left, Some(self.elems_left))
     }
 }
-impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {
+impl<'a, Z: AsZippedRefs<'a>> ExactSizeIterator for IterMut<'a, Z> {
     fn len(&self) -> usize { self.elems_left }
 }
 
-impl<K, V> Iterator for IntoIter<K, V> {
-    type Item = (SafeHash, K, V);
+impl<Z: ZippedPtrs> Iterator for IntoIter<Z> {
+    type Item = (SafeHash, Z::Values);
 
-    fn next(&mut self) -> Option<(SafeHash, K, V)> {
+    fn next(&mut self) -> Option<(SafeHash, Z::Values)> {
         self.iter.next().map(|bucket| {
             self.table.size -= 1;
             unsafe {
@@ -911,8 +885,7 @@ impl<K, V> Iterator for IntoIter<K, V> {
                     SafeHash {
                         hash: *bucket.hash,
                     },
-                    ptr::read(bucket.key),
-                    ptr::read(bucket.val)
+                    bucket.data.read()
                 )
             }
         })
@@ -923,15 +896,15 @@ impl<K, V> Iterator for IntoIter<K, V> {
         (size, Some(size))
     }
 }
-impl<K, V> ExactSizeIterator for IntoIter<K, V> {
+impl<Z: ZippedPtrs> ExactSizeIterator for IntoIter<Z> {
     fn len(&self) -> usize { self.table.size() }
 }
 
-impl<'a, K, V> Iterator for Drain<'a, K, V> {
-    type Item = (SafeHash, K, V);
+impl<'a, Z: ZippedPtrs> Iterator for Drain<'a, Z> {
+    type Item = (SafeHash, Z::Values);
 
     #[inline]
-    fn next(&mut self) -> Option<(SafeHash, K, V)> {
+    fn next(&mut self) -> Option<(SafeHash, Z::Values)> {
         self.iter.next().map(|bucket| {
             self.table.size -= 1;
             unsafe {
@@ -939,8 +912,7 @@ impl<'a, K, V> Iterator for Drain<'a, K, V> {
                     SafeHash {
                         hash: ptr::replace(bucket.hash, EMPTY_BUCKET),
                     },
-                    ptr::read(bucket.key),
-                    ptr::read(bucket.val)
+                    bucket.data.read()
                 )
             }
         })
@@ -951,20 +923,23 @@ impl<'a, K, V> Iterator for Drain<'a, K, V> {
         (size, Some(size))
     }
 }
-impl<'a, K, V> ExactSizeIterator for Drain<'a, K, V> {
+impl<'a, Z: ZippedPtrs> ExactSizeIterator for Drain<'a, Z> {
     fn len(&self) -> usize { self.table.size() }
 }
 
-impl<'a, K: 'a, V: 'a> Drop for Drain<'a, K, V> {
+impl<'a, Z: ZippedPtrs> Drop for Drain<'a, Z> {
     fn drop(&mut self) {
         for _ in self {}
     }
 }
 
-impl<K: Clone, V: Clone> Clone for RawTable<K, V> {
-    fn clone(&self) -> RawTable<K, V> {
+impl<Z> Clone for RawTable<Z>
+    where Z: CloneZipped + Copy
+{
+    fn clone(&self) -> RawTable<Z> {
         unsafe {
-            let mut new_ht = RawTable::new_uninitialized(self.capacity());
+            let mut new_ht: RawTable<Z> =
+                RawTable::new_uninitialized(self.capacity());
 
             {
                 let cap = self.capacity();
@@ -973,13 +948,9 @@ impl<K: Clone, V: Clone> Clone for RawTable<K, V> {
                 while buckets.index() != cap {
                     match buckets.peek() {
                         Full(full) => {
-                            let (h, k, v) = {
-                                let (k, v) = full.read();
-                                (full.hash(), k.clone(), v.clone())
-                            };
+                            let (h, v) = (full.hash(), full.clone_values());
                             *new_buckets.raw.hash = h.inspect();
-                            ptr::write(new_buckets.raw.key, k);
-                            ptr::write(new_buckets.raw.val, v);
+                            new_buckets.raw.data.write(v);
                         }
                         Empty(..) => {
                             *new_buckets.raw.hash = EMPTY_BUCKET;
@@ -997,8 +968,8 @@ impl<K: Clone, V: Clone> Clone for RawTable<K, V> {
     }
 }
 
-impl<K, V> Drop for RawTable<K, V> {
-    #[unsafe_destructor_blind_to_params]
+impl<Z: ZippedPtrs> Drop for RawTable<Z> {
+    //#[unsafe_destructor_blind_to_params]
     fn drop(&mut self) {
         if self.capacity == 0 || self.capacity == mem::POST_DROP_USIZE {
             return;
@@ -1010,20 +981,15 @@ impl<K, V> Drop for RawTable<K, V> {
         // dropping empty tables such as on resize.
         // Also avoid double drop of elements that have been already moved out.
         unsafe {
-            if needs_drop::<(K, V)>() { // avoid linear runtime for types that don't need drop
+            if needs_drop::<Z::Values>() { // avoid linear runtime for types that don't need drop
                 for _ in self.rev_move_buckets() {}
             }
         }
 
-        let hashes_size = self.capacity * size_of::<u64>();
-        let keys_size = self.capacity * size_of::<K>();
-        let vals_size = self.capacity * size_of::<V>();
-        let (align, _, size, oflo) =
-            calculate_allocation(hashes_size, align_of::<u64>(),
-                                 keys_size, align_of::<K>(),
-                                 vals_size, align_of::<V>());
-
-        debug_assert!(!oflo, "should be impossible");
+        // We have validated the size during initialization,
+        // so unchecked calculation can be used now.
+        let size = allocation_size_unchecked::<Z>(self.capacity);
+        let align = allocation_align::<Z>();
 
         unsafe {
             deallocate(*self.hashes as *mut u8, size, align);
