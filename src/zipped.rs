@@ -81,28 +81,25 @@ fn round_up_to_next(unrounded: usize, target_alignment: usize) -> usize {
     (unrounded + target_alignment - 1) & !(target_alignment - 1)
 }
 
-/// Rounds up to a multiple of a power of two. Returns a tuple of
-/// (_rounded_, `false`) with _rounded_ being the closest multiple of
+/// Rounds up to a multiple of a power of two. Returns the closest multiple of
 /// `target_alignment` that is higher or equal to  `unrounded`, if such a
-/// value can be represented by `usize`.
-/// Otherwise, the first member of the returned tuple is a wrapped value
-/// and the second member is `true`.
+/// value can be represented by `usize`. Otherwise, returns `None`.
 ///
 /// # Panics
 ///
 /// Panics if `target_alignment` is not a power of two.
 #[inline]
-fn overflowing_round_up_to_next(unrounded: usize, target_alignment: usize)
-                                -> (usize, bool) {
+fn checked_round_up_to_next(unrounded: usize, target_alignment: usize)
+                            -> Option<usize> {
     assert!(target_alignment.is_power_of_two());
 
     // target_alignment is positive,
     // so (target_alignment - 1) does not need overflow checking
 
-    let (advanced, oflo) = unrounded.overflowing_add(target_alignment - 1);
-    let rounded = advanced & !(target_alignment - 1);
-
-    (rounded, oflo)
+    unrounded.checked_add(target_alignment - 1)
+        .map(|acc| {
+            acc & !(target_alignment - 1)
+        })
 }
 
 #[test]
@@ -110,24 +107,22 @@ fn test_rounding() {
     use std::usize;
 
     assert_eq!(round_up_to_next(0, 4), 0);
+    assert_eq!(checked_round_up_to_next(0, 4), Some(0));
     assert_eq!(round_up_to_next(1, 4), 4);
+    assert_eq!(checked_round_up_to_next(1, 4), Some(4));
     assert_eq!(round_up_to_next(2, 4), 4);
+    assert_eq!(checked_round_up_to_next(2, 4), Some(4));
     assert_eq!(round_up_to_next(3, 4), 4);
+    assert_eq!(checked_round_up_to_next(3, 4), Some(4));
     assert_eq!(round_up_to_next(4, 4), 4);
+    assert_eq!(checked_round_up_to_next(4, 4), Some(4));
     assert_eq!(round_up_to_next(5, 4), 8);
-    assert_eq!(overflowing_round_up_to_next(0, 4), (0, false));
-    assert_eq!(overflowing_round_up_to_next(1, 4), (4, false));
-    assert_eq!(overflowing_round_up_to_next(3, 4), (4, false));
-    assert_eq!(overflowing_round_up_to_next(4, 4), (4, false));
-    assert_eq!(overflowing_round_up_to_next(5, 4), (8, false));
-    assert_eq!(overflowing_round_up_to_next(usize::MAX & !3, 4),
-               (usize::MAX & !3, false));
-    let (_, overflow) = overflowing_round_up_to_next((usize::MAX & !3) + 1, 4);
-    assert!(overflow);
-    let (_, overflow) = overflowing_round_up_to_next(usize::MAX, 4);
-    assert!(overflow);
-    let (_, overflow) = overflowing_round_up_to_next(usize::MAX, 2);
-    assert!(overflow);
+    assert_eq!(checked_round_up_to_next(5, 4), Some(8));
+    assert_eq!(checked_round_up_to_next(usize::MAX & !3, 4),
+               Some(usize::MAX & !3));
+    assert_eq!(checked_round_up_to_next((usize::MAX & !3) + 1, 4), None);
+    assert_eq!(checked_round_up_to_next(usize::MAX, 4), None);
+    assert_eq!(checked_round_up_to_next(usize::MAX, 2), None);
 }
 
 #[inline]
@@ -140,14 +135,12 @@ fn unzipped_size_append_unchecked(offset: usize, size: usize, align: usize)
 }
 
 #[inline]
-fn unzipped_size_append_overflowing(offset: usize, size: usize, align: usize)
-                                    -> (usize, bool) {
-    let (splice_offset, oflo1) =
-            overflowing_round_up_to_next(offset, align);
-    let (total_size, oflo2) =
-            splice_offset.overflowing_add(size);
-
-    (total_size, oflo1 | oflo2)
+fn unzipped_size_append_checked(offset: usize, size: usize, align: usize)
+                                -> Option<usize> {
+    checked_round_up_to_next(offset, align)
+        .and_then(|aligned_offset| {
+            aligned_offset.checked_add(size)
+        })
 }
 
 impl<T> ZippedPtrs for LonePtr<T> {
@@ -190,15 +183,10 @@ impl<T> ZippedPtrs for LonePtr<T> {
     }
 
     fn alloc_size_append(offset: usize, length: usize) -> Option<usize> {
-        let (size, oflo1) = length.overflowing_mul(size_of::<T>());
-        let (total, oflo2) = unzipped_size_append_overflowing(offset, size,
-                                                              align_of::<T>());
-
-        if oflo1 | oflo2 {
-            None
-        } else {
-            Some(total)
-        }
+        length.checked_mul(size_of::<T>())
+            .and_then(|size| {
+                unzipped_size_append_checked(offset, size, align_of::<T>())
+            })
     }
 
     fn align() -> usize { align_of::<T>() }
@@ -264,19 +252,17 @@ impl<K, V> ZippedPtrs for PairPtrs<K, V> {
     }
 
     fn alloc_size_append(offset: usize, length: usize) -> Option<usize> {
-        let (keys_size, oflo1) = length.overflowing_mul(size_of::<K>());
-        let (vals_size, oflo2) = length.overflowing_mul(size_of::<V>());
-        let (end_of_keys, oflo3) =
-            unzipped_size_append_overflowing(offset, keys_size,
-                                             align_of::<K>());
-        let (end_of_vals, oflo4) =
-            unzipped_size_append_overflowing(end_of_keys, vals_size,
-                                             align_of::<V>());
-
-        if oflo1 | oflo2 | oflo3 | oflo4 {
-            None
+        let sizes_checked = (length.checked_mul(size_of::<K>()),
+                             length.checked_mul(size_of::<V>()));
+        if let (Some(keys_size), Some(vals_size)) = sizes_checked {
+            unzipped_size_append_checked(offset, keys_size,
+                                         align_of::<K>())
+                .and_then(|end_of_keys| {
+                    unzipped_size_append_checked(end_of_keys, vals_size,
+                                                 align_of::<V>())
+                })
         } else {
-            Some(end_of_vals)
+            None
         }
     }
 
