@@ -201,20 +201,46 @@ impl<Z, M> EmptyBucket<Z, M> {
     pub fn table(&self) -> &M {
         &self.table
     }
-    /// Move out the reference to the table.
-    pub fn into_table(self) -> M {
-        self.table
-    }
 }
 
 impl<Z, M> Bucket<Z, M> {
-    /// Move out the reference to the table.
-    pub fn into_table(self) -> M {
-        self.table
-    }
     /// Get the raw index.
     pub fn index(&self) -> usize {
         self.idx
+    }
+}
+
+impl<Z, M> Deref for FullBucket<Z, M>
+    where Z: ZippedPtrs, M: Deref<Target=RawTable<Z>>
+{
+    type Target = RawTable<Z>;
+    fn deref(&self) -> &RawTable<Z> {
+        &self.table
+    }
+}
+
+/// `Put` is implemented for types which provide access to a table and cannot be invalidated
+///  by filling a bucket. A similar implementation for `Take` is possible.
+pub trait Put<Z: ZippedPtrs> {
+    unsafe fn borrow_table_mut(&mut self) -> &mut RawTable<Z>;
+}
+
+
+impl<'t, Z> Put<Z> for &'t mut RawTable<Z> where Z: ZippedPtrs {
+    unsafe fn borrow_table_mut(&mut self) -> &mut RawTable<Z> {
+        *self
+    }
+}
+
+impl<Z, M> Put<Z> for Bucket<Z, M> where Z: ZippedPtrs, M: Put<Z> {
+    unsafe fn borrow_table_mut(&mut self) -> &mut RawTable<Z> {
+        self.table.borrow_table_mut()
+    }
+}
+
+impl<Z, M> Put<Z> for FullBucket<Z, M> where Z: ZippedPtrs, M: Put<Z> {
+    unsafe fn borrow_table_mut(&mut self) -> &mut RawTable<Z> {
+        self.table.borrow_table_mut()
     }
 }
 
@@ -270,22 +296,14 @@ impl<Z, M> Bucket<Z, M>
 
     /// Modifies the bucket pointer in place to make it point to the next slot.
     pub fn next(&mut self) {
-        // Branchless bucket iteration step.
-        // As we reach the end of the table...
-        // We take the current idx:          0111111b
-        // Xor it by its increment:        ^ 1000000b
-        //                               ------------
-        //                                   1111111b
-        // Then AND with the capacity:     & 1000000b
-        //                               ------------
-        // to get the backwards offset:      1000000b
-        // ... and it's zero at all other times.
-        let maybe_wraparound_dist = (self.idx ^ (self.idx + 1)) & self.table.capacity();
-        // Finally, we obtain the offset 1 or the offset -cap + 1.
-        let dist = 1 - (maybe_wraparound_dist as isize);
-
         self.idx += 1;
-
+        let range = self.table.capacity();
+        // This code is branchless thanks to a conditional move.
+        let dist = if self.idx & (range - 1) == 0 {
+            1 - range as isize
+        } else {
+            1
+        };
         unsafe {
             self.raw = self.raw.offset(dist);
         }
@@ -330,8 +348,7 @@ impl<Z, M> EmptyBucket<Z, M>
     }
 }
 
-impl<Z, M> EmptyBucket<Z, M>
-    where Z: ZippedPtrs, M: Deref<Target=RawTable<Z>> + DerefMut
+impl<Z, M> EmptyBucket<Z, M> where Z: ZippedPtrs, M: Put<Z>
 {
     /// Puts given table entry, along with the key's hash,
     /// into this bucket in the hashtable. Note how `self` is 'moved' into
@@ -345,16 +362,16 @@ impl<Z, M> EmptyBucket<Z, M>
         unsafe {
             *self.raw.hash = hash.inspect();
             self.raw.data.write(data);
-        }
 
-        self.table.size += 1;
+            self.table.borrow_table_mut().size += 1;
+        }
 
         FullBucket { raw: self.raw, idx: self.idx, table: self.table }
     }
 }
 
 impl<Z, M> FullBucket<Z, M>
-    where Z: ZippedPtrs, M: Deref<Target=RawTable<Z>>
+    where Z: ZippedPtrs + Copy, M: Deref<Target=RawTable<Z>>
 {
     #[inline]
     pub fn next(self) -> Bucket<Z, M> {
@@ -372,12 +389,22 @@ impl<Z, M> FullBucket<Z, M>
         }
     }
 
+    /// Duplicates the current position. This can be useful for operations
+    /// on two or more buckets.
+    pub fn stash(self) -> FullBucket<Z, Self> {
+        FullBucket {
+            raw: self.raw,
+            idx: self.idx,
+            table: self,
+        }
+    }
+
     /// Get the distance between this bucket and the 'ideal' location
     /// as determined by the key's hash stored in it.
     ///
     /// In the cited blog posts above, this is called the "distance to
     /// initial bucket", or DIB. Also known as "probe count".
-    pub fn distance(&self) -> usize {
+    pub fn displacement(&self) -> usize {
         // Calculates the distance one has to travel when going from
         // `hash mod capacity` onwards to `idx mod capacity`, wrapping around
         // if the destination is not reached before the end of the table.
@@ -414,14 +441,15 @@ impl<Z, M> FullBucket<Z, M>
     }
 }
 
-impl<Z, M> FullBucket<Z, M>
-    where Z: ZippedPtrs + Copy, M: Deref<Target=RawTable<Z>> + DerefMut
-{
+// We take a mutable reference to the table instead of accepting anything that
+// implements `DerefMut` to prevent fn `take` from being called on `stash`ed
+// buckets.
+impl<'t, Z: ZippedPtrs + Copy> FullBucket<Z, &'t mut RawTable<Z>> {
     /// Removes this bucket's key and value from the hashtable.
     ///
     /// This works similarly to `put`, building an `EmptyBucket` out of the
     /// taken bucket.
-    pub fn take(mut self) -> (EmptyBucket<Z, M>, Z::Values) {
+    pub fn take(mut self) -> (EmptyBucket<Z, &'t mut RawTable<Z>>, Z::Values) {
         self.table.size -= 1;
 
         unsafe {
@@ -436,7 +464,11 @@ impl<Z, M> FullBucket<Z, M>
             )
         }
     }
+}
 
+// This use of `Put` is misleading and restrictive, but safe and sufficient for our use cases
+// where `M` is a full bucket or table reference type with mutable access to the table.
+impl<Z, M> FullBucket<Z, M> where Z: ZippedPtrs, M: Put<Z> {
     pub fn replace(&mut self, h: SafeHash, v: Z::Values) -> (SafeHash, Z::Values) {
         unsafe {
             let old_hash = ptr::replace(self.raw.hash as *mut SafeHash, h);
@@ -447,7 +479,9 @@ impl<Z, M> FullBucket<Z, M>
     }
 }
 
-impl<Z, M> FullBucket<Z, M> where for<'a> Z: AsZippedRefs<'a>
+impl<Z, M> FullBucket<Z, M>
+    where for<'a> Z: AsZippedRefs<'a>,
+          M: Deref<Target=RawTable<Z>> + DerefMut
 {
     /// Gets mutable references to the key and value at a given index.
     pub fn read_mut<'t>(&'t mut self) -> <Z as AsZippedRefs<'t>>::MutRefs {
@@ -484,19 +518,7 @@ impl<'t, Z, M> FullBucket<Z, M>
     }
 }
 
-impl<Z, M> BucketState<Z, M> {
-    // For convenience.
-    pub fn expect_full(self) -> FullBucket<Z, M> {
-        match self {
-            Full(full) => full,
-            Empty(..) => panic!("Expected full bucket")
-        }
-    }
-}
-
-impl<Z, M> GapThenFull<Z, M>
-    where Z: ZippedPtrs, M: Deref<Target=RawTable<Z>>
-{
+impl<Z, M> GapThenFull<Z, M> {
     #[inline]
     pub fn full(&self) -> &FullBucket<Z, M> {
         &self.full
