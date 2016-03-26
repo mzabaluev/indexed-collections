@@ -49,12 +49,10 @@ pub trait CloneZipped : ZippedPtrs {
     unsafe fn clone_zipped(&self) -> Self::Values;
 }
 
-#[derive(Copy, Clone)]
 pub struct LonePtr<T> {
     ptr: *mut T
 }
 
-#[derive(Copy, Clone)]
 pub struct PairPtrs<K, V> {
     key: *mut K,
     val: *mut V
@@ -62,8 +60,17 @@ pub struct PairPtrs<K, V> {
 
 // The zipped pointer types are copyable akin to raw pointers:
 // as long as the access interface is unsafe, the instances can be safely
-// copyable.
+// copied.
 
+impl<T> Copy for LonePtr<T> {}
+impl<T> Clone for LonePtr<T> {
+    fn clone(&self) -> LonePtr<T> { *self }
+}
+
+impl<K, V> Copy for PairPtrs<K, V> {}
+impl<K, V> Clone for PairPtrs<K, V> {
+    fn clone(&self) -> PairPtrs<K, V> { *self }
+}
 
 /// Rounds up to a multiple of a power of two. Returns the closest multiple
 /// of `target_alignment` that is higher or equal to `unrounded`.
