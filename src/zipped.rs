@@ -8,6 +8,7 @@
 // except according to those terms.
 
 use std::cmp;
+use std::marker;
 use std::mem::{align_of, size_of};
 use std::ptr;
 
@@ -34,15 +35,6 @@ pub trait ZippedPtrs : Sized {
     fn alloc_size_append(offset: usize, length: usize) -> Option<usize>;
     fn alloc_size_append_unchecked(offset: usize, length: usize) -> usize;
     fn align() -> usize;
-}
-
-pub trait AsZippedRefs<'a> : ZippedPtrs {
-
-    type Refs: 'a;
-    type MutRefs: 'a;
-
-    unsafe fn as_refs(&self) -> Self::Refs;
-    unsafe fn as_mut_refs(&self) -> Self::MutRefs;
 }
 
 pub trait CloneZipped : ZippedPtrs {
@@ -278,31 +270,63 @@ impl<K, V> ZippedPtrs for PairPtrs<K, V> {
     }
 }
 
-impl<'a, T: 'a> AsZippedRefs<'a> for LonePtr<T> {
+pub struct Refs<'a, Z> where Z: ZippedPtrs, Z::Values: 'a {
+    ptrs: Z,
+    marker: marker::PhantomData<&'a Z::Values>
+}
 
-    type Refs    = &'a T;
-    type MutRefs = &'a mut T;
+pub struct MutRefs<'a, Z> where Z: ZippedPtrs, Z::Values: 'a {
+    ptrs: Z,
+    marker: marker::PhantomData<&'a mut Z::Values>
+}
 
-    unsafe fn as_refs(&self) -> &'a T {
-        &*self.ptr
-    }
-
-    unsafe fn as_mut_refs(&self) -> &'a mut T {
-        &mut *self.ptr
+impl<'a, Z: ZippedPtrs> Refs<'a, Z> {
+    pub unsafe fn from_ptrs(ptrs: Z) -> Refs<'a, Z> {
+        Refs {
+            ptrs: ptrs,
+            marker: marker::PhantomData
+        }
     }
 }
 
-impl<'a, K: 'a, V: 'a> AsZippedRefs<'a> for PairPtrs<K, V> {
-
-    type Refs    = (&'a K, &'a V);
-    type MutRefs = (&'a mut K, &'a mut V);
-
-    unsafe fn as_refs(&self) -> (&'a K, &'a V) {
-        (&*self.key, &*self.val)
+impl<'a, Z: ZippedPtrs> MutRefs<'a, Z> {
+    pub unsafe fn from_ptrs(ptrs: Z) -> MutRefs<'a, Z> {
+        MutRefs {
+            ptrs: ptrs,
+            marker: marker::PhantomData
+        }
     }
+}
 
-    unsafe fn as_mut_refs(&self) -> (&'a mut K, &'a mut V) {
-        (&mut *self.key, &mut *self.val)
+impl<'a, T> Refs<'a, LonePtr<T>> {
+    pub fn into_concrete(self) -> &'a T {
+        unsafe {
+            &*self.ptrs.ptr
+        }
+    }
+}
+
+impl<'a, T> MutRefs<'a, LonePtr<T>> {
+    pub fn into_concrete(self) -> &'a mut T {
+        unsafe {
+            &mut *self.ptrs.ptr
+        }
+    }
+}
+
+impl<'a, K, V> Refs<'a, PairPtrs<K, V>> {
+    pub fn into_concrete(self) -> (&'a K, &'a V) {
+        unsafe {
+            (&*self.ptrs.key, &*self.ptrs.val)
+        }
+    }
+}
+
+impl<'a, K, V> MutRefs<'a, PairPtrs<K, V>> {
+    pub fn into_concrete(self) -> (&'a mut K, &'a mut V) {
+        unsafe {
+            (&mut *self.ptrs.key, &mut *self.ptrs.val)
+        }
     }
 }
 

@@ -19,7 +19,7 @@ use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{self, Unique};
 
-use zipped::{AsZippedRefs, CloneZipped, ZippedPtrs};
+use zipped::{ZippedPtrs, Refs, MutRefs, CloneZipped};
 
 use self::BucketState::*;
 
@@ -421,12 +421,13 @@ impl<Z, M> FullBucket<Z, M>
     }
 }
 
-impl<Z, M> FullBucket<Z, M> where for<'a> Z: AsZippedRefs<'a>
+impl<Z, M> FullBucket<Z, M>
+    where Z: ZippedPtrs + Copy, M: Deref<Target=RawTable<Z>>
 {
     /// Gets references to the entry values at a given index.
-    pub fn read<'t>(&'t self) -> <Z as AsZippedRefs<'t>>::Refs {
+    pub fn read<'t>(&'t self) -> Refs<'t, Z> {
         unsafe {
-            self.raw.data.as_refs()
+            Refs::from_ptrs(self.raw.data)
         }
     }
 }
@@ -480,40 +481,39 @@ impl<Z, M> FullBucket<Z, M> where Z: ZippedPtrs, M: Put<Z> {
 }
 
 impl<Z, M> FullBucket<Z, M>
-    where for<'a> Z: AsZippedRefs<'a>,
-          M: Deref<Target=RawTable<Z>> + DerefMut
+    where Z: ZippedPtrs + Copy, M: Deref<Target=RawTable<Z>> + DerefMut
 {
     /// Gets mutable references to the key and value at a given index.
-    pub fn read_mut<'t>(&'t mut self) -> <Z as AsZippedRefs<'t>>::MutRefs {
+    pub fn read_mut<'t>(&'t mut self) -> MutRefs<'t, Z> {
         unsafe {
-            self.raw.data.as_mut_refs()
+            MutRefs::from_ptrs(self.raw.data)
         }
     }
 }
 
 impl<'t, Z, M> FullBucket<Z, M>
-    where Z: AsZippedRefs<'t>, M: Deref<Target=RawTable<Z>> + 't
+    where Z: ZippedPtrs, M: Deref<Target=RawTable<Z>> + 't
 {
     /// Exchange a bucket state for immutable references into the table.
     /// Because the underlying reference to the table is also consumed,
     /// no further changes to the structure of the table are possible;
     /// in exchange for this, the returned references have a longer lifetime
     /// than the references returned by `read()`.
-    pub fn into_refs(self) -> Z::Refs {
+    pub fn into_refs(self) -> Refs<'t, Z> {
         unsafe {
-            self.raw.data.as_refs()
+            Refs::from_ptrs(self.raw.data)
         }
     }
 }
 
 impl<'t, Z, M> FullBucket<Z, M>
-    where Z: AsZippedRefs<'t>, M: Deref<Target=RawTable<Z>> + DerefMut + 't
+    where Z: ZippedPtrs, M: Deref<Target=RawTable<Z>> + DerefMut + 't
 {
     /// This works similarly to `into_refs`, exchanging a bucket state
     /// for mutable references into the table.
-    pub fn into_mut_refs(self) -> Z::MutRefs {
+    pub fn into_mut_refs(self) -> MutRefs<'t, Z> {
         unsafe {
-            self.raw.data.as_mut_refs()
+            MutRefs::from_ptrs(self.raw.data)
         }
     }
 }
@@ -810,8 +810,10 @@ pub struct Iter<'a, Z> {
     elems_left: usize,
 }
 
-unsafe impl<'a, Z> Sync for Iter<'a, Z> where Z: ZippedPtrs, Z::Values: Sync {}
-unsafe impl<'a, Z> Send for Iter<'a, Z> where Z: ZippedPtrs, Z::Values: Sync {}
+unsafe impl<'a, Z> Sync for Iter<'a, Z>
+    where Z: ZippedPtrs, Z::Values: Sync {}
+unsafe impl<'a, Z> Send for Iter<'a, Z>
+    where Z: ZippedPtrs, Z::Values: Sync {}
 
 impl<'a, Z: Copy> Clone for Iter<'a, Z> {
     fn clone(&self) -> Iter<'a, Z> {
@@ -856,14 +858,14 @@ unsafe impl<'a, Z> Sync for Drain<'a, Z>
 unsafe impl<'a, Z> Send for Drain<'a, Z>
     where Z: ZippedPtrs, Z::Values: Send {}
 
-impl<'a, Z: AsZippedRefs<'a>> Iterator for Iter<'a, Z> {
-    type Item = Z::Refs;
+impl<'a, Z> Iterator for Iter<'a, Z> where Z: ZippedPtrs, Z::Values: 'a {
+    type Item = Refs<'a, Z>;
 
-    fn next(&mut self) -> Option<Z::Refs> {
+    fn next(&mut self) -> Option<Refs<'a, Z>> {
         self.iter.next().map(|bucket| {
             self.elems_left -= 1;
             unsafe {
-                bucket.data.as_refs()
+                Refs::from_ptrs(bucket.data)
             }
         })
     }
@@ -872,18 +874,20 @@ impl<'a, Z: AsZippedRefs<'a>> Iterator for Iter<'a, Z> {
         (self.elems_left, Some(self.elems_left))
     }
 }
-impl<'a, Z: AsZippedRefs<'a>> ExactSizeIterator for Iter<'a, Z> {
+impl<'a, Z> ExactSizeIterator for Iter<'a, Z>
+    where Z: ZippedPtrs, Z::Values: 'a
+{
     fn len(&self) -> usize { self.elems_left }
 }
 
-impl<'a, Z: AsZippedRefs<'a>> Iterator for IterMut<'a, Z> {
-    type Item = Z::MutRefs;
+impl<'a, Z> Iterator for IterMut<'a, Z> where Z: ZippedPtrs, Z::Values: 'a {
+    type Item = MutRefs<'a, Z>;
 
-    fn next(&mut self) -> Option<Z::MutRefs> {
+    fn next(&mut self) -> Option<MutRefs<'a, Z>> {
         self.iter.next().map(|bucket| {
             self.elems_left -= 1;
             unsafe {
-                bucket.data.as_mut_refs()
+                MutRefs::from_ptrs(bucket.data)
             }
         })
     }
@@ -892,7 +896,9 @@ impl<'a, Z: AsZippedRefs<'a>> Iterator for IterMut<'a, Z> {
         (self.elems_left, Some(self.elems_left))
     }
 }
-impl<'a, Z: AsZippedRefs<'a>> ExactSizeIterator for IterMut<'a, Z> {
+impl<'a, Z> ExactSizeIterator for IterMut<'a, Z>
+    where Z: ZippedPtrs, Z::Values: 'a
+{
     fn len(&self) -> usize { self.elems_left }
 }
 
