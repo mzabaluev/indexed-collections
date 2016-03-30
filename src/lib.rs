@@ -17,9 +17,12 @@
 #![feature(unsafe_no_drop_flag)]
 
 extern crate alloc;
+extern crate rand;
 
-mod hash {
-    mod table;
+mod hash;
+
+pub mod hash_map {
+    pub use super::hash::map::*;
 }
 
 mod zipped;
