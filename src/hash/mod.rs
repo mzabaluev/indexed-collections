@@ -11,6 +11,7 @@
 //! Unordered containers, implemented as hash-tables
 
 mod table;
+mod indexed;
 pub mod map;
 
 trait Recover<Q: ?Sized> {
