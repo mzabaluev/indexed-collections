@@ -21,35 +21,36 @@ pub trait HashIndexer<V> {
     fn hash_key<H: Hasher>(&self, val: &V, state: &mut H);
 }
 
-struct HashValueFn<F> {
-    func: F
-}
 
-struct HashRefFn<F> {
-    func: F
-}
-
-impl<F> HashValueFn<F> {
-    fn new<K, V>(func: F) -> HashValueFn<F>
-        where F: Fn(&V) -> K, K: Eq + Hash {
-
-        HashValueFn { func: func }
-    }
-}
-
-impl<F> HashRefFn<F> {
-    fn new<K: ?Sized, V>(func: F) -> HashRefFn<F>
-        where F: Fn(&V) -> &K, K: Eq + Hash {
-
-        HashRefFn { func: func }
-    }
-}
-
-// The two impls below are similar, except for the bound on F.
+// The two types below below are nearly identical, except for the bound on F.
 // It would be nice to be able to unify the types with
 //     where F: Fn(&V) -> R, R: Borrow<K>, K: Hash
 
-impl<K, V, F> HashIndexer<V> for HashValueFn<F>
+struct HashKeyFn<F> {
+    func: F
+}
+
+struct HashRefKeyFn<F> {
+    func: F
+}
+
+impl<F> HashKeyFn<F> {
+    fn new<K, V>(func: F) -> HashKeyFn<F>
+        where F: Fn(&V) -> K, K: Eq + Hash {
+
+        HashKeyFn { func: func }
+    }
+}
+
+impl<F> HashRefKeyFn<F> {
+    fn new<K: ?Sized, V>(func: F) -> HashRefKeyFn<F>
+        where F: Fn(&V) -> &K, K: Eq + Hash {
+
+        HashRefKeyFn { func: func }
+    }
+}
+
+impl<K, V, F> HashIndexer<V> for HashKeyFn<F>
     where F: Fn(&V) -> K, K: Hash {
 
     type Key = K;
@@ -65,7 +66,7 @@ impl<K, V, F> HashIndexer<V> for HashValueFn<F>
     }
 }
 
-impl<K: ?Sized, V, F> HashIndexer<V> for HashRefFn<F>
+impl<K: ?Sized, V, F> HashIndexer<V> for HashRefKeyFn<F>
     where F: Fn(&V) -> &K, K: Hash {
 
     type Key = K;
@@ -99,7 +100,7 @@ impl<T: Hash> HashIndexer<T> for IdentityIndexer {
 
 #[test]
 fn test_fn_indexer() {
-    let indexer = HashRefFn::new(|s: &String| &s[..]);
+    let indexer = HashRefKeyFn::new(|s: &String| &s[..]);
     let s1 = String::from("hello");
     assert!(indexer.eq_key(&s1, "hello"));
     assert!(indexer.eq_key(&s1, &s1[..]));
