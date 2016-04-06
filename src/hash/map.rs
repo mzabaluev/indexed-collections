@@ -359,7 +359,7 @@ fn search_hashed<K, V, M, F>(table: M,
     }
 
     let size = table.size() as isize;
-    let mut probe: Bucket<PairPtrs<K, V>, M> = Bucket::new(table, hash);
+    let mut probe = Bucket::new(table, hash);
     let ib = probe.index() as isize;
 
     loop {
