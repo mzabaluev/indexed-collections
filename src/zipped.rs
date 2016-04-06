@@ -27,7 +27,7 @@ pub trait ZippedPtrs : Sized {
 
     unsafe fn copy_nonoverlapping(src: &Self, dst: &Self, count: usize);
 
-    unsafe fn from_unzipped_buf(buffer: *mut u8,
+    unsafe fn from_unzipped_buf(buffer: *const u8,
                                 offset: usize,
                                 length: usize)
                                 -> Self;
@@ -42,12 +42,14 @@ pub trait CloneZipped : ZippedPtrs {
 }
 
 pub struct LonePtr<T> {
-    ptr: *mut T
+    // We use *const to ensure covariance with respect to T
+    ptr: *const T
 }
 
 pub struct PairPtrs<K, V> {
-    key: *mut K,
-    val: *mut V
+    // We use *const to ensure covariance with respect to K and V
+    key: *const K,
+    val: *const V
 }
 
 // The zipped pointer types are copyable akin to raw pointers:
@@ -153,7 +155,7 @@ impl<T> ZippedPtrs for LonePtr<T> {
     }
 
     unsafe fn write(&self, values: T) {
-        ptr::write(self.ptr, values)
+        ptr::write(self.ptr as *mut T, values)
     }
 
     unsafe fn read(&self) -> T {
@@ -161,19 +163,19 @@ impl<T> ZippedPtrs for LonePtr<T> {
     }
 
     unsafe fn replace(&self, values: T) -> T {
-        ptr::replace(self.ptr, values)
+        ptr::replace(self.ptr as *mut T, values)
     }
 
     unsafe fn copy_nonoverlapping(src: &Self, dst: &Self, count: usize) {
-        ptr::copy_nonoverlapping(src.ptr, dst.ptr, count);
+        ptr::copy_nonoverlapping(src.ptr, dst.ptr as *mut T, count);
     }
 
-    unsafe fn from_unzipped_buf(buffer: *mut u8,
+    unsafe fn from_unzipped_buf(buffer: *const u8,
                                 offset: usize,
                                 _length: usize)
                                 -> LonePtr<T> {
         let vals_offset = round_up_to_next(offset, align_of::<T>());
-        LonePtr { ptr: buffer.offset(vals_offset as isize) as *mut T }
+        LonePtr { ptr: buffer.offset(vals_offset as isize) as *const T }
     }
 
     fn alloc_size_append_unchecked(offset: usize, length: usize) -> usize {
@@ -203,8 +205,8 @@ impl<K, V> ZippedPtrs for PairPtrs<K, V> {
     }
 
     unsafe fn write(&self, entry: (K, V)) {
-        ptr::write(self.key, entry.0);
-        ptr::write(self.val, entry.1);
+        ptr::write(self.key as *mut K, entry.0);
+        ptr::write(self.val as *mut V, entry.1);
     }
 
     unsafe fn read(&self) -> (K, V) {
@@ -212,18 +214,18 @@ impl<K, V> ZippedPtrs for PairPtrs<K, V> {
     }
 
     unsafe fn replace(&self, entry: (K, V)) -> (K, V) {
-        let old_key = ptr::replace(self.key, entry.0);
-        let old_val = ptr::replace(self.val, entry.1);
+        let old_key = ptr::replace(self.key as *mut K, entry.0);
+        let old_val = ptr::replace(self.val as *mut V, entry.1);
 
         (old_key, old_val)
     }
 
     unsafe fn copy_nonoverlapping(src: &Self, dst: &Self, count: usize) {
-        ptr::copy_nonoverlapping(src.key, dst.key, count);
-        ptr::copy_nonoverlapping(src.val, dst.val, count);
+        ptr::copy_nonoverlapping(src.key, dst.key as *mut K, count);
+        ptr::copy_nonoverlapping(src.val, dst.val as *mut V, count);
     }
 
-    unsafe fn from_unzipped_buf(buffer: *mut u8,
+    unsafe fn from_unzipped_buf(buffer: *const u8,
                                 offset: usize,
                                 length: usize)
                                 -> PairPtrs<K, V> {
@@ -232,8 +234,8 @@ impl<K, V> ZippedPtrs for PairPtrs<K, V> {
         let end_of_keys = keys_offset + keys_size;
         let vals_offset = round_up_to_next(end_of_keys, align_of::<V>());
         PairPtrs {
-            key: buffer.offset(keys_offset as isize) as *mut K,
-            val: buffer.offset(vals_offset as isize) as *mut V
+            key: buffer.offset(keys_offset as isize) as *const K,
+            val: buffer.offset(vals_offset as isize) as *const V
         }
     }
 
@@ -309,7 +311,7 @@ impl<'a, T> Refs<'a, LonePtr<T>> {
 impl<'a, T> MutRefs<'a, LonePtr<T>> {
     pub fn into_concrete(self) -> &'a mut T {
         unsafe {
-            &mut *self.ptrs.ptr
+            &mut *(self.ptrs.ptr as *mut T)
         }
     }
 }
@@ -325,7 +327,8 @@ impl<'a, K, V> Refs<'a, PairPtrs<K, V>> {
 impl<'a, K, V> MutRefs<'a, PairPtrs<K, V>> {
     pub fn into_concrete(self) -> (&'a mut K, &'a mut V) {
         unsafe {
-            (&mut *self.ptrs.key, &mut *self.ptrs.val)
+            (&mut *(self.ptrs.key as *mut K),
+             &mut *(self.ptrs.val as *mut V))
         }
     }
 }

@@ -16,7 +16,7 @@ use std::borrow::Borrow;
 use std::cmp::max;
 use std::fmt::{self, Debug};
 use std::hash::{Hash, SipHasher, BuildHasher};
-use std::iter::{self, Map, FromIterator};
+use std::iter::FromIterator;
 use std::mem::{self, replace};
 use std::ops::{Deref, Index};
 use rand::{self, Rng};
@@ -829,8 +829,7 @@ impl<K, V, S> HashMap<K, V, S>
     /// }
     /// ```
     pub fn keys<'a>(&'a self) -> Keys<'a, K, V> {
-        fn first<A, B>((a, _): (A, B)) -> A { a }
-        Keys { inner: self.iter().map(first) }
+        Keys { inner: self.iter() }
     }
 
     /// An iterator visiting all values in arbitrary order.
@@ -851,8 +850,34 @@ impl<K, V, S> HashMap<K, V, S>
     /// }
     /// ```
     pub fn values<'a>(&'a self) -> Values<'a, K, V> {
-        fn second<A, B>((_, b): (A, B)) -> B { b }
-        Values { inner: self.iter().map(second) }
+        Values { inner: self.iter() }
+    }
+
+    /// An iterator visiting all values mutably in arbitrary order.
+    /// Iterator element type is `&'a mut V`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #![feature(map_values_mut)]
+    /// use std::collections::HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    ///
+    /// map.insert("a", 1);
+    /// map.insert("b", 2);
+    /// map.insert("c", 3);
+    ///
+    /// for val in map.values_mut() {
+    ///     *val = *val + 10;
+    /// }
+    ///
+    /// for val in map.values() {
+    ///     print!("{}", val);
+    /// }
+    /// ```
+    pub fn values_mut<'a>(&'a mut self) -> ValuesMut<'a, K, V> {
+        ValuesMut { inner: self.iter_mut() }
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
@@ -978,9 +1003,8 @@ impl<K, V, S> HashMap<K, V, S>
     /// ```
     #[inline]
     pub fn drain(&mut self) -> Drain<K, V> {
-        fn second<A, B>((_, b): (A, B)) -> B { b }
         Drain {
-            inner: self.table.drain().map(second),
+            inner: self.table.drain(),
         }
     }
 
@@ -1199,12 +1223,12 @@ pub struct IterMut<'a, K: 'a, V: 'a> {
 
 /// HashMap move iterator.
 pub struct IntoIter<K, V> {
-    inner: iter::Map<table::IntoIter<PairPtrs<K, V>>, fn((SafeHash, (K, V))) -> (K, V)>
+    inner: table::IntoIter<PairPtrs<K, V>>
 }
 
 /// HashMap keys iterator.
 pub struct Keys<'a, K: 'a, V: 'a> {
-    inner: Map<Iter<'a, K, V>, fn((&'a K, &'a V)) -> &'a K>
+    inner: Iter<'a, K, V>
 }
 
 // FIXME(#19839) Remove in favor of `#[derive(Clone)]`
@@ -1218,7 +1242,7 @@ impl<'a, K, V> Clone for Keys<'a, K, V> {
 
 /// HashMap values iterator.
 pub struct Values<'a, K: 'a, V: 'a> {
-    inner: Map<Iter<'a, K, V>, fn((&'a K, &'a V)) -> &'a V>
+    inner: Iter<'a, K, V>
 }
 
 // FIXME(#19839) Remove in favor of `#[derive(Clone)]`
@@ -1232,7 +1256,12 @@ impl<'a, K, V> Clone for Values<'a, K, V> {
 
 /// HashMap drain iterator.
 pub struct Drain<'a, K: 'a, V: 'a> {
-    inner: iter::Map<table::Drain<'a, PairPtrs<K, V>>, fn((SafeHash, (K, V))) -> (K, V)>
+    inner: table::Drain<'a, PairPtrs<K, V>>
+}
+
+/// Mutable HashMap values iterator.
+pub struct ValuesMut<'a, K: 'a, V: 'a> {
+    inner: IterMut<'a, K, V>
 }
 
 enum InternalEntry<K, V, M> {
@@ -1359,9 +1388,8 @@ impl<K, V, S> IntoIterator for HashMap<K, V, S>
     /// let vec: Vec<(&str, isize)> = map.into_iter().collect();
     /// ```
     fn into_iter(self) -> IntoIter<K, V> {
-        fn second<A, B>((_, b): (A, B)) -> B { b }
         IntoIter {
-            inner: self.table.into_iter().map(second)
+            inner: self.table.into_iter()
         }
     }
 }
@@ -1400,7 +1428,11 @@ impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {
 impl<K, V> Iterator for IntoIter<K, V> {
     type Item = (K, V);
 
-    #[inline] fn next(&mut self) -> Option<(K, V)> { self.inner.next() }
+    #[inline]
+    fn next(&mut self) -> Option<(K, V)> {
+        self.inner.next().map(|(_, (k, v))| (k, v))
+    }
+
     #[inline] fn size_hint(&self) -> (usize, Option<usize>) { self.inner.size_hint() }
 }
 impl<K, V> ExactSizeIterator for IntoIter<K, V> {
@@ -1410,7 +1442,7 @@ impl<K, V> ExactSizeIterator for IntoIter<K, V> {
 impl<'a, K, V> Iterator for Keys<'a, K, V> {
     type Item = &'a K;
 
-    #[inline] fn next(&mut self) -> Option<(&'a K)> { self.inner.next() }
+    #[inline] fn next(&mut self) -> Option<(&'a K)> { self.inner.next().map(|(k, _)| k) }
     #[inline] fn size_hint(&self) -> (usize, Option<usize>) { self.inner.size_hint() }
 }
 impl<'a, K, V> ExactSizeIterator for Keys<'a, K, V> {
@@ -1420,17 +1452,31 @@ impl<'a, K, V> ExactSizeIterator for Keys<'a, K, V> {
 impl<'a, K, V> Iterator for Values<'a, K, V> {
     type Item = &'a V;
 
-    #[inline] fn next(&mut self) -> Option<(&'a V)> { self.inner.next() }
+    #[inline] fn next(&mut self) -> Option<(&'a V)> { self.inner.next().map(|(_, v)| v) }
     #[inline] fn size_hint(&self) -> (usize, Option<usize>) { self.inner.size_hint() }
 }
 impl<'a, K, V> ExactSizeIterator for Values<'a, K, V> {
     #[inline] fn len(&self) -> usize { self.inner.len() }
 }
 
+impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
+    type Item = &'a mut V;
+
+    #[inline] fn next(&mut self) -> Option<(&'a mut V)> { self.inner.next().map(|(_, v)| v) }
+    #[inline] fn size_hint(&self) -> (usize, Option<usize>) { self.inner.size_hint() }
+}
+impl<'a, K, V> ExactSizeIterator for ValuesMut<'a, K, V> {
+    #[inline] fn len(&self) -> usize { self.inner.len() }
+}
+
 impl<'a, K, V> Iterator for Drain<'a, K, V> {
     type Item = (K, V);
 
-    #[inline] fn next(&mut self) -> Option<(K, V)> { self.inner.next() }
+    #[inline]
+    fn next(&mut self) -> Option<(K, V)> {
+        self.inner.next().map(|(_, (k, v))| (k, v))
+    }
+
     #[inline] fn size_hint(&self) -> (usize, Option<usize>) { self.inner.size_hint() }
 }
 impl<'a, K, V> ExactSizeIterator for Drain<'a, K, V> {
@@ -1620,6 +1666,20 @@ impl<K, S, Q: ?Sized> super::Recover<Q> for HashMap<K, (), S>
             }
         }
     }
+}
+
+#[allow(dead_code)]
+fn assert_covariance() {
+    fn map_key<'new>(v: HashMap<&'static str, u8>) -> HashMap<&'new str, u8> { v }
+    fn map_val<'new>(v: HashMap<u8, &'static str>) -> HashMap<u8, &'new str> { v }
+    fn iter_key<'a, 'new>(v: Iter<'a, &'static str, u8>) -> Iter<'a, &'new str, u8> { v }
+    fn iter_val<'a, 'new>(v: Iter<'a, u8, &'static str>) -> Iter<'a, u8, &'new str> { v }
+    fn into_iter_key<'new>(v: IntoIter<&'static str, u8>) -> IntoIter<&'new str, u8> { v }
+    fn into_iter_val<'new>(v: IntoIter<u8, &'static str>) -> IntoIter<u8, &'new str> { v }
+    fn keys_key<'a, 'new>(v: Keys<'a, &'static str, u8>) -> Keys<'a, &'new str, u8> { v }
+    fn keys_val<'a, 'new>(v: Keys<'a, u8, &'static str>) -> Keys<'a, u8, &'new str> { v }
+    fn values_key<'a, 'new>(v: Values<'a, &'static str, u8>) -> Values<'a, &'new str, u8> { v }
+    fn values_val<'a, 'new>(v: Values<'a, u8, &'static str>) -> Values<'a, u8, &'new str> { v }
 }
 
 #[cfg(test)]
@@ -1843,6 +1903,7 @@ mod test_map {
         assert_eq!(m.drain().next(), None);
         assert_eq!(m.keys().next(), None);
         assert_eq!(m.values().next(), None);
+        assert_eq!(m.values_mut().next(), None);
         assert_eq!(m.iter().next(), None);
         assert_eq!(m.iter_mut().next(), None);
         assert_eq!(m.len(), 0);
@@ -2017,6 +2078,20 @@ mod test_map {
         assert!(values.contains(&'a'));
         assert!(values.contains(&'b'));
         assert!(values.contains(&'c'));
+    }
+
+    #[test]
+    fn test_values_mut() {
+        let vec = vec![(1, 1), (2, 2), (3, 3)];
+        let mut map: HashMap<_, _> = vec.into_iter().collect();
+        for value in map.values_mut() {
+            *value = (*value) * 2
+        }
+        let values: Vec<_> = map.values().cloned().collect();
+        assert_eq!(values.len(), 3);
+        assert!(values.contains(&2));
+        assert!(values.contains(&4));
+        assert!(values.contains(&6));
     }
 
     #[test]

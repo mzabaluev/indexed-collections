@@ -627,7 +627,7 @@ impl<Z: ZippedPtrs> RawTable<Z> {
 
     fn first_bucket_raw(&self) -> RawBucket<Z> {
         let hashes_size = self.capacity * size_of::<u64>();
-        let buffer = *self.hashes as *mut u8;
+        let buffer = *self.hashes as *const u8;
         unsafe {
             let data = ZippedPtrs::from_unzipped_buf(buffer,
                                                      hashes_size,
@@ -681,6 +681,7 @@ impl<Z: ZippedPtrs> RawTable<Z> {
         IterMut {
             iter: self.raw_buckets(),
             elems_left: self.size(),
+            _marker: marker::PhantomData,
         }
     }
 
@@ -826,9 +827,11 @@ impl<'a, Z: Copy> Clone for Iter<'a, Z> {
 
 
 /// Iterator over mutable references to entries in a table.
-pub struct IterMut<'a, Z> {
+pub struct IterMut<'a, Z: ZippedPtrs> where Z::Values: 'a {
     iter: RawBuckets<'a, Z>,
     elems_left: usize,
+    // To ensure invariance with respect to Z::Values
+    _marker: marker::PhantomData<&'a mut Z::Values>,
 }
 
 unsafe impl<'a, Z> Sync for IterMut<'a, Z>
