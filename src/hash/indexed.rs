@@ -275,6 +275,16 @@ impl<T, F, S> HashTable<T, F, S>
         let hash = self.make_hash(q);
         search_hashed(&self.table, hash, |v| self.indexer.eq_key(v, q))
     }
+
+    #[inline]
+    fn search_mut<'a, Q: ?Sized>(&'a mut self, q: &Q)
+                                 -> InternalEntry<T, &'a mut RawTable<LonePtr<T>>>
+        where F::Key: Borrow<Q>, Q: Eq + Hash
+    {
+        let hash = self.make_hash(q);
+        let indexer = &self.indexer;
+        search_hashed(&mut self.table, hash, |v| indexer.eq_key(v, q))
+    }
 }
 
 impl<T, F, S> HashTable<T, F, S>
@@ -291,6 +301,30 @@ impl<T, F, S> HashTable<T, F, S>
     {
         self.search(k).into_occupied_bucket().map(|bucket| {
             bucket.into_refs().into_concrete()
+        })
+    }
+
+    /// Returns true if the table contains a value for the specified key.
+    ///
+    /// The key may be any borrowed form of the indexer's key type, but
+    /// `Hash` and `Eq` on the borrowed form *must* match those for
+    /// the key type.
+    pub fn contains_key<Q: ?Sized>(&self, k: &Q) -> bool
+        where F::Key: Borrow<Q>, Q: Hash + Eq
+    {
+        self.search(k).into_occupied_bucket().is_some()
+    }
+
+    /// Returns a mutable reference to the value corresponding to the key.
+    ///
+    /// The key may be any borrowed form of the indexer's key type, but
+    /// `Hash` and `Eq` on the borrowed form *must* match those for
+    /// the key type.
+    pub fn get_mut<Q: ?Sized>(&mut self, k: &Q) -> Option<&mut T>
+        where F::Key: Borrow<Q>, Q: Hash + Eq
+    {
+        self.search_mut(k).into_occupied_bucket().map(|bucket| {
+            bucket.into_mut_refs().into_concrete()
         })
     }
 }
