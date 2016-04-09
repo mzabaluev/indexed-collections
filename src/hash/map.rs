@@ -431,10 +431,7 @@ fn robin_hood<'a, K: 'a, V: 'a>(bucket: FullBucketMut<'a, PairPtrs<K, V>>,
                         mut val: V)
                         -> &'a mut V {
     let starting_index = bucket.index();
-    let size = {
-        let table = bucket.table(); // FIXME "lifetime too short".
-        table.size()
-    };
+    let size = bucket.table().size();
     // Save the *starting point*.
     let mut bucket = bucket.stash();
     // There can be at most `size - dib` buckets to displace, because
@@ -739,10 +736,9 @@ impl<K, V, S> HashMap<K, V, S>
                     let h = bucket.hash();
                     let (b, (k, v)) = bucket.take();
                     self.insert_hashed_ordered(h, k, v);
-                    {
-                        let t = b.table(); // FIXME "lifetime too short".
-                        if t.size() == 0 { break }
-                    };
+                    if b.table().size() == 0 {
+                        break;
+                    }
                     b.into_bucket()
                 }
                 Empty(b) => b.into_bucket()
