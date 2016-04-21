@@ -11,7 +11,7 @@
 use alloc::heap::{allocate, deallocate, EMPTY};
 
 use std::cmp;
-use std::hash::{Hash, Hasher, BuildHasher};
+use std::hash::{Hash, Hasher};
 use std::intrinsics::needs_drop;
 use std::marker;
 use std::mem::{align_of, size_of};
@@ -145,11 +145,9 @@ impl SafeHash {
 /// We need to remove hashes of 0. That's reserved for empty buckets.
 /// This function wraps up `hash_keyed` to be the only way outside this
 /// module to generate a SafeHash.
-pub fn make_hash<T: ?Sized, S>(hash_state: &S, t: &T) -> SafeHash
-    where T: Hash, S: BuildHasher
+pub fn make_hash<S>(state: &S) -> SafeHash
+    where S: Hasher
 {
-    let mut state = hash_state.build_hasher();
-    t.hash(&mut state);
     // We need to avoid 0 in order to prevent collisions with
     // EMPTY_HASH. We can maintain our precious uniform distribution
     // of initial indexes by unconditionally setting the MSB,

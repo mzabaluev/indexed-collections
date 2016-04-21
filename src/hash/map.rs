@@ -482,7 +482,9 @@ impl<K, V, S> HashMap<K, V, S>
     where K: Eq + Hash, S: BuildHasher
 {
     fn make_hash<X: ?Sized>(&self, x: &X) -> SafeHash where X: Hash {
-        table::make_hash(&self.hash_builder, x)
+        let mut state = self.hash_builder.build_hasher();
+        x.hash(&mut state);
+        table::make_hash(&state)
     }
 
     /// Search for a key, yielding the index if it's found in the hashtable.
