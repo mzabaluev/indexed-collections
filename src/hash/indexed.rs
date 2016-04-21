@@ -38,6 +38,8 @@ pub trait HashIndexer<V> {
     fn eq_key<Q: ?Sized>(&self, val: &V, key: &Q) -> bool
         where Self::Key: Borrow<Q>, Q: Eq;
 
+    fn eq_val(&self, a: &V, b: &V) -> bool;
+
     fn hash_key<H: Hasher>(&self, val: &V, state: &mut H);
 }
 
@@ -71,7 +73,7 @@ impl<F> HashRefKeyFn<F> {
 }
 
 impl<K, V, F> HashIndexer<V> for HashKeyFn<F>
-    where F: Fn(&V) -> K, K: Hash {
+    where F: Fn(&V) -> K, K: Eq + Hash {
 
     type Key = K;
 
@@ -79,6 +81,10 @@ impl<K, V, F> HashIndexer<V> for HashKeyFn<F>
         where K: Borrow<Q>, Q: Eq {
 
         *(self.func)(val).borrow() == *key
+    }
+
+    fn eq_val(&self, a: &V, b: &V) -> bool {
+        (self.func)(a) == (self.func)(b)
     }
 
     fn hash_key<H: Hasher>(&self, val: &V, state: &mut H) {
@@ -87,7 +93,7 @@ impl<K, V, F> HashIndexer<V> for HashKeyFn<F>
 }
 
 impl<K: ?Sized, V, F> HashIndexer<V> for HashRefKeyFn<F>
-    where F: Fn(&V) -> &K, K: Hash {
+    where F: Fn(&V) -> &K, K: Eq + Hash {
 
     type Key = K;
 
@@ -95,6 +101,10 @@ impl<K: ?Sized, V, F> HashIndexer<V> for HashRefKeyFn<F>
         where K: Borrow<Q>, Q: Eq {
 
         *(self.func)(val).borrow() == *key
+    }
+
+    fn eq_val(&self, a: &V, b: &V) -> bool {
+        *(self.func)(a) == *(self.func)(b)
     }
 
     fn hash_key<H: Hasher>(&self, val: &V, state: &mut H) {
@@ -104,13 +114,17 @@ impl<K: ?Sized, V, F> HashIndexer<V> for HashRefKeyFn<F>
 
 struct IdentityIndexer;
 
-impl<T: Hash> HashIndexer<T> for IdentityIndexer {
+impl<T: Eq + Hash> HashIndexer<T> for IdentityIndexer {
     type Key = T;
 
     fn eq_key<Q: ?Sized>(&self, val: &T, key: &Q) -> bool
         where T: Borrow<Q>, Q: Eq {
 
         *val.borrow() == *key
+    }
+
+    fn eq_val(&self, a: &T, b: &T) -> bool {
+        *a == *b
     }
 
     fn hash_key<H: Hasher>(&self, val: &T, state: &mut H) {
